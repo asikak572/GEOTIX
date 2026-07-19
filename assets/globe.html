@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+  <script src="https://cdn.jsdelivr.net/npm/cesium@1.127.0/Build/Cesium/Cesium.js"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/cesium@1.127.0/Build/Cesium/Widgets/widgets.css">
+  <style>
+    html,body,#globe{width:100%;height:100%;margin:0;overflow:hidden;background:#010b12}
+    .cesium-viewer-bottom,.cesium-viewer-toolbar,.cesium-viewer-animationContainer,.cesium-viewer-timelineContainer{display:none!important}
+  </style>
+</head>
+<body>
+  <div id="globe"></div>
+  <script>
+    (async function () {
+      const imagery = await Cesium.TileMapServiceImageryProvider.fromUrl(
+        Cesium.buildModuleUrl('Assets/Textures/NaturalEarthII')
+      );
+      const viewer = new Cesium.Viewer('globe', {
+        baseLayer: new Cesium.ImageryLayer(imagery),
+        terrainProvider: new Cesium.EllipsoidTerrainProvider(),
+        animation: false,
+        timeline: false,
+        geocoder: false,
+        homeButton: false,
+        sceneModePicker: false,
+        baseLayerPicker: false,
+        navigationHelpButton: false,
+        fullscreenButton: false,
+        selectionIndicator: false,
+        infoBox: false,
+        requestRenderMode: true
+      });
+      viewer.scene.globe.enableLighting = false;
+      viewer.scene.globe.baseColor = Cesium.Color.fromCssColorString('#063858');
+      viewer.scene.backgroundColor = Cesium.Color.fromCssColorString('#010b12');
+      viewer.scene.skyBox.show = false;
+      viewer.scene.sun.show = false;
+      viewer.scene.moon.show = false;
+      viewer.camera.setView({
+        destination: Cesium.Cartesian3.fromDegrees(78.0, 18.0, 19000000)
+      });
+
+      const places = [
+        {name:'Chennai', region:'Tamil Nadu, India', stories:12, lon:80.2707, lat:13.0827},
+        {name:'London', region:'England, United Kingdom', stories:9, lon:-0.1276, lat:51.5072},
+        {name:'Tokyo', region:'Tokyo Prefecture, Japan', stories:6, lon:139.6917, lat:35.6895},
+        {name:'New Delhi', region:'Delhi, India', stories:8, lon:77.2090, lat:28.6139}
+      ];
+      places.forEach(p => viewer.entities.add({
+        position: Cesium.Cartesian3.fromDegrees(p.lon, p.lat),
+        properties: p,
+        point: {
+          pixelSize: 15,
+          color: Cesium.Color.fromCssColorString('#ff4c61'),
+          outlineColor: Cesium.Color.WHITE,
+          outlineWidth: 2,
+          disableDepthTestDistance: Number.POSITIVE_INFINITY
+        },
+        label: {
+          text: p.name + '  ' + p.stories,
+          font: 'bold 13px sans-serif',
+          fillColor: Cesium.Color.WHITE,
+          showBackground: true,
+          backgroundColor: Cesium.Color.fromCssColorString('#061523').withAlpha(.88),
+          pixelOffset: new Cesium.Cartesian2(0, -28),
+          disableDepthTestDistance: Number.POSITIVE_INFINITY
+        }
+      }));
+
+      const handler = new Cesium.ScreenSpaceEventHandler(viewer.scene.canvas);
+      handler.setInputAction(function (click) {
+        const picked = viewer.scene.pick(click.position);
+        if (!Cesium.defined(picked) || !picked.id || !picked.id.properties) return;
+        const time = Cesium.JulianDate.now();
+        const p = picked.id.properties;
+        const message = [p.name.getValue(time), p.region.getValue(time), p.stories.getValue(time)].join('|');
+        if (window.Geotix) window.Geotix.postMessage(message);
+      }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+    })().catch(function (error) {
+      document.body.innerHTML = '<div style="padding:24px;color:white;font-family:sans-serif">Globe could not load. Check your internet connection.<br><small>' + error + '</small></div>';
+    });
+  </script>
+</body>
+</html>
