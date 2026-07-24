@@ -1,17 +1,24 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
 import 'package:webview_flutter/webview_flutter.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
-void main() => runApp(const GeotixApp());
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await savedNews.load();
+  runApp(const GeotixApp());
+}
 
 const navy = Color(0xFF02070D);
 const panel = Color(0xFF0C1D29);
 const cyan = Color(0xFF59D9FF);
 const muted = Color(0xFF91A6B3);
+final savedNews = SavedNewsStore();
 
 class GeotixApp extends StatelessWidget {
   const GeotixApp({super.key});
@@ -147,7 +154,68 @@ class _GlobePageState extends State<GlobePage> {
   String place = 'Chennai';
   String region = 'Tamil Nadu, India';
   int stories = 12;
+  bool markerSheetOpen = false;
   void select(String p, String r, int s) => setState(() { place = p; region = r; stories = s; });
+
+  Future<void> showMarkerNews(String p, String r, int count) async {
+    if (!mounted || markerSheetOpen) return;
+    select(p, r, count);
+    markerSheetOpen = true;
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: Colors.transparent,
+      isScrollControlled: true,
+      builder: (sheetContext) => SafeArea(
+        top: false,
+        child: Container(
+          margin: const EdgeInsets.all(12),
+          padding: const EdgeInsets.fromLTRB(18, 10, 18, 18),
+          decoration: BoxDecoration(
+            color: const Color(0xFF081B2A),
+            borderRadius: BorderRadius.circular(26),
+            border: Border.all(color: const Color(0xFF247395)),
+            boxShadow: const [BoxShadow(color: Color(0x99000000), blurRadius: 30)],
+          ),
+          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Center(child: Container(width: 42, height: 4, decoration: BoxDecoration(color: const Color(0xFF617787), borderRadius: BorderRadius.circular(4)))),
+            const SizedBox(height: 16),
+            Row(children: [
+              const Icon(Icons.location_on, color: cyan),
+              const SizedBox(width: 8),
+              Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text(p, style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w900)),
+                Text(r, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: muted)),
+              ])),
+              Container(padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6), decoration: BoxDecoration(color: const Color(0x332FE6A0), borderRadius: BorderRadius.circular(20)), child: const Text('● LIVE', style: TextStyle(color: Color(0xFF51E5A8), fontSize: 11, fontWeight: FontWeight.bold))),
+            ]),
+            const SizedBox(height: 18),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(16),
+              decoration: BoxDecoration(color: const Color(0xFF102A3D), borderRadius: BorderRadius.circular(19)),
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                const Text('BREAKING', style: TextStyle(color: Color(0xFFFF6478), fontSize: 10, fontWeight: FontWeight.w900, letterSpacing: 1.4)),
+                const SizedBox(height: 7),
+                Text('Important local development reported in $p', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w800, height: 1.25)),
+                const SizedBox(height: 9),
+                Text('8 min ago  •  $count active stories', style: const TextStyle(color: muted, fontSize: 12)),
+              ]),
+            ),
+            const SizedBox(height: 14),
+            SizedBox(width: double.infinity, height: 52, child: FilledButton.icon(
+              onPressed: () {
+                Navigator.pop(sheetContext);
+                Navigator.push(context, MaterialPageRoute(builder: (_) => LocationNewsScreen(place: p, region: r, storyCount: count)));
+              },
+              icon: const Icon(Icons.radar),
+              label: const Text('VIEW ALL STORIES', style: TextStyle(fontWeight: FontWeight.w900, letterSpacing: .8)),
+            )),
+          ]),
+        ),
+      ),
+    );
+    markerSheetOpen = false;
+  }
 
   double get currentLocalHour {
     final now = DateTime.now();
@@ -210,6 +278,15 @@ class _GlobePageState extends State<GlobePage> {
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(content: Text(message.message)),
           );
+        },
+      )
+      ..addJavaScriptChannel(
+        'GeotixStory',
+        onMessageReceived: (message) {
+          final parts = message.message.split('|');
+          if (parts.length == 3) {
+            showMarkerNews(parts[0], parts[1], int.tryParse(parts[2]) ?? 0);
+          }
         },
       )
       ..loadFlutterAsset('assets/globe.html');
@@ -391,12 +468,39 @@ class ExplorePage extends StatefulWidget {
 
 class _ExplorePageState extends State<ExplorePage> {
   String filter = 'All';
-  final items = const [
-    Story('BREAKING', 'Chennai, Tamil Nadu', 'Major transport update announced for Chennai', '12 min ago', Color(0xFFFF4C61)),
-    Story('TECHNOLOGY', 'Tokyo, Japan', 'New robotics technology demonstrated in Tokyo', '28 min ago', Color(0xFF19BDEB)),
-    Story('WEATHER', 'London, United Kingdom', 'Weather advisory issued across Greater London', '45 min ago', Color(0xFF8B7CFF)),
-    Story('TRAVEL', 'Paris, France', 'New visitor route opens near central Paris', '1 hr ago', Color(0xFFFFB84D)),
-  ];
+  final searchController = TextEditingController();
+  List<Story> items = [];
+  bool loading = true;
+  String searchedPlace = 'Chennai';
+  String? error;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => loadNews('Chennai'));
+  }
+
+  @override
+  void dispose() {
+    searchController.dispose();
+    super.dispose();
+  }
+
+  Future<void> loadNews(String rawQuery) async {
+    final query = rawQuery.trim();
+    if (query.isEmpty) return;
+    FocusScope.of(context).unfocus();
+    setState(() { loading = true; error = null; searchedPlace = query; filter = 'All'; });
+    try {
+      final result = await LiveNewsService.fetch(query, 'Searched location');
+      if (!mounted) return;
+      setState(() { items = result; loading = false; });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() { loading = false; error = 'Could not load news for $query.'; });
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final shown = filter == 'All' ? items : items.where((s) => s.category == filter.toUpperCase()).toList();
@@ -407,14 +511,30 @@ class _ExplorePageState extends State<ExplorePage> {
             const SizedBox(height: 5),
             const Text('Explore reality news', style: TextStyle(fontSize: 27, fontWeight: FontWeight.bold)),
             const SizedBox(height: 16),
-            const SearchBox(hint: 'Search locations or stories'),
+            SearchBox(hint: 'Search country, state, city or district', controller: searchController, onSubmitted: loadNews),
             const SizedBox(height: 14),
-            SingleChildScrollView(scrollDirection: Axis.horizontal, child: Row(children: ['All', 'Breaking', 'Weather', 'Technology', 'Travel'].map((f) => Padding(
+            SingleChildScrollView(scrollDirection: Axis.horizontal, child: Row(children: ['All', 'Breaking', 'Local', 'Weather', 'Technology', 'Travel'].map((f) => Padding(
               padding: const EdgeInsets.only(right: 8),
               child: ChoiceChip(label: Text(f), selected: filter == f, onSelected: (_) => setState(() => filter = f), selectedColor: const Color(0xFF19BDEB), labelStyle: TextStyle(color: filter == f ? const Color(0xFF001018) : Colors.white, fontWeight: FontWeight.bold)),
             )).toList())),
             const SizedBox(height: 16),
-            ...shown.map((story) => StoryCard(story: story)),
+            if (loading) const Padding(padding: EdgeInsets.all(44), child: Center(child: CircularProgressIndicator(color: cyan)))
+            else if (error != null) InfoCard(child: Column(children: [
+              const Icon(Icons.cloud_off, color: muted, size: 42),
+              const SizedBox(height: 10),
+              Text(error!, textAlign: TextAlign.center, style: const TextStyle(fontWeight: FontWeight.bold)),
+              const SizedBox(height: 12),
+              OutlinedButton.icon(onPressed: () => loadNews(searchedPlace), icon: const Icon(Icons.refresh), label: const Text('RETRY')),
+            ]))
+            else if (shown.isEmpty) InfoCard(child: Column(children: [
+              const Icon(Icons.manage_search, color: cyan, size: 42),
+              const SizedBox(height: 10),
+              Text(filter == 'All' ? 'No headlines found for $searchedPlace.' : 'No $filter headlines found for $searchedPlace.', textAlign: TextAlign.center),
+            ]))
+            else ...shown.map((story) => StoryCard(
+              story: story,
+              onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => NewsDetailScreen(story: story))),
+            )),
           ],
         ));
   }
@@ -436,19 +556,39 @@ class AlertsPage extends StatelessWidget {
 class SavedPage extends StatelessWidget {
   const SavedPage({super.key});
   @override
-  Widget build(BuildContext context) => const Center(child: Padding(
-        padding: EdgeInsets.all(28),
-        child: Column(mainAxisSize: MainAxisSize.min, children: [
-          Icon(Icons.bookmark_outline, size: 72, color: cyan),
-          SizedBox(height: 16),
-          Text('No saved stories yet', textAlign: TextAlign.center, style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
-          SizedBox(height: 8),
-          Text('Tap the bookmark on a story to keep it here.', textAlign: TextAlign.center, style: TextStyle(color: muted)),
-        ]),
-      ));
+  Widget build(BuildContext context) => AnimatedBuilder(
+        animation: savedNews,
+        builder: (context, _) {
+          if (savedNews.items.isEmpty) {
+            return const Center(child: Padding(
+              padding: EdgeInsets.all(28),
+              child: Column(mainAxisSize: MainAxisSize.min, children: [
+                Icon(Icons.bookmark_outline, size: 72, color: cyan),
+                SizedBox(height: 16),
+                Text('No saved stories yet', textAlign: TextAlign.center, style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
+                SizedBox(height: 8),
+                Text('Tap the bookmark on a story to keep it here.', textAlign: TextAlign.center, style: TextStyle(color: muted)),
+              ]),
+            ));
+          }
+          return LayoutBuilder(builder: (context, c) => ListView(
+            padding: EdgeInsets.fromLTRB(c.maxWidth < 380 ? 14 : 20, 18, c.maxWidth < 380 ? 14 : 20, 30),
+            children: [
+              const Text('YOUR COLLECTION', style: TextStyle(color: cyan, fontSize: 11, letterSpacing: 2)),
+              const SizedBox(height: 5),
+              Text('${savedNews.items.length} saved ${savedNews.items.length == 1 ? 'story' : 'stories'}', style: const TextStyle(fontSize: 27, fontWeight: FontWeight.w900)),
+              const SizedBox(height: 18),
+              ...savedNews.items.map((story) => StoryCard(
+                story: story,
+                onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => NewsDetailScreen(story: story))),
+              )),
+            ],
+          ));
+        },
+      );
 }
 
-class LocationNewsScreen extends StatelessWidget {
+class LocationNewsScreen extends StatefulWidget {
   const LocationNewsScreen({
     super.key,
     required this.place,
@@ -460,18 +600,28 @@ class LocationNewsScreen extends StatelessWidget {
   final String region;
   final int storyCount;
 
-  List<Story> get locationStories => [
-        Story('BREAKING', '$place, $region', 'Important local development reported in $place', '8 min ago', const Color(0xFFFF4C61)),
-        Story('LOCAL', '$place, $region', 'Residents respond to today’s major update', '24 min ago', const Color(0xFF19BDEB)),
-        Story('WEATHER', '$place, $region', 'Latest weather and travel conditions for $place', '42 min ago', const Color(0xFF8B7CFF)),
-        Story('TRAVEL', '$place, $region', 'What visitors should know before travelling today', '1 hr ago', const Color(0xFFFFB84D)),
-      ];
+  @override
+  State<LocationNewsScreen> createState() => _LocationNewsScreenState();
+}
+
+class _LocationNewsScreenState extends State<LocationNewsScreen> {
+  late Future<List<Story>> newsFuture;
+
+  @override
+  void initState() {
+    super.initState();
+    newsFuture = LiveNewsService.fetch(widget.place, widget.region);
+  }
+
+  void retry() => setState(() {
+        newsFuture = LiveNewsService.fetch(widget.place, widget.region);
+      });
 
   @override
   Widget build(BuildContext context) => Scaffold(
         appBar: AppBar(
           backgroundColor: const Color(0xFF061523),
-          title: Text(place, style: const TextStyle(fontWeight: FontWeight.w800)),
+          title: Text(widget.place, style: const TextStyle(fontWeight: FontWeight.w800)),
         ),
         body: LayoutBuilder(builder: (context, c) {
           final side = c.maxWidth < 380 ? 14.0 : 20.0;
@@ -483,8 +633,8 @@ class LocationNewsScreen extends StatelessWidget {
                 children: [
                   const Text('REALITY NEWS BY PLACE', style: TextStyle(color: cyan, fontSize: 10, letterSpacing: 2)),
                   const SizedBox(height: 6),
-                  Text(place, style: TextStyle(fontSize: c.maxWidth < 380 ? 27 : 32, fontWeight: FontWeight.w900)),
-                  Text(region, style: const TextStyle(color: muted, fontSize: 14)),
+                  Text(widget.place, style: TextStyle(fontSize: c.maxWidth < 380 ? 27 : 32, fontWeight: FontWeight.w900)),
+                  Text(widget.region, style: const TextStyle(color: muted, fontSize: 14)),
                   const SizedBox(height: 16),
                   Container(
                     padding: const EdgeInsets.all(15),
@@ -492,18 +642,34 @@ class LocationNewsScreen extends StatelessWidget {
                     child: Row(children: [
                       const Icon(Icons.radar, color: cyan),
                       const SizedBox(width: 12),
-                      Expanded(child: Text('$storyCount active stories near $place', style: const TextStyle(fontWeight: FontWeight.bold))),
+                      Expanded(child: Text('Live headlines near ${widget.place}', style: const TextStyle(fontWeight: FontWeight.bold))),
                       const Text('LIVE', style: TextStyle(color: Color(0xFF51E5A8), fontSize: 10, fontWeight: FontWeight.bold)),
                     ]),
                   ),
                   const SizedBox(height: 18),
-                  ...locationStories.map((story) => StoryCard(
+                  FutureBuilder<List<Story>>(
+                    future: newsFuture,
+                    builder: (context, snapshot) {
+                      if (snapshot.connectionState == ConnectionState.waiting) {
+                        return const Padding(padding: EdgeInsets.all(42), child: Center(child: CircularProgressIndicator(color: cyan)));
+                      }
+                      if (snapshot.hasError || !snapshot.hasData || snapshot.data!.isEmpty) {
+                        return InfoCard(child: Column(children: [
+                          const Icon(Icons.cloud_off, color: muted, size: 42),
+                          const SizedBox(height: 10),
+                          const Text('Live news is temporarily unavailable.', style: TextStyle(fontWeight: FontWeight.bold)),
+                          const SizedBox(height: 4),
+                          const Text('Check your internet connection and try again.', style: TextStyle(color: muted, fontSize: 12)),
+                          const SizedBox(height: 12),
+                          OutlinedButton.icon(onPressed: retry, icon: const Icon(Icons.refresh), label: const Text('RETRY')),
+                        ]));
+                      }
+                      return Column(children: snapshot.data!.map((story) => StoryCard(
                         story: story,
-                        onTap: () => Navigator.push(
-                          context,
-                          MaterialPageRoute(builder: (_) => NewsDetailScreen(story: story)),
-                        ),
-                      )),
+                        onTap: () => Navigator.push(context, MaterialPageRoute(builder: (_) => NewsDetailScreen(story: story))),
+                      )).toList());
+                    },
+                  ),
                 ],
               ),
             ),
@@ -521,7 +687,21 @@ class NewsDetailScreen extends StatelessWidget {
         appBar: AppBar(
           backgroundColor: const Color(0xFF061523),
           title: const Text('GEOTIX NEWS', style: TextStyle(fontWeight: FontWeight.w900, letterSpacing: 2)),
-          actions: [IconButton(onPressed: () {}, icon: const Icon(Icons.bookmark_border))],
+          actions: [AnimatedBuilder(
+            animation: savedNews,
+            builder: (context, _) => IconButton(
+              tooltip: savedNews.contains(story) ? 'Remove from saved' : 'Save story',
+              onPressed: () {
+                final wasSaved = savedNews.contains(story);
+                savedNews.toggle(story);
+                ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                  content: Text(wasSaved ? 'Removed from Saved' : 'Story saved'),
+                  duration: const Duration(seconds: 1),
+                ));
+              },
+              icon: Icon(savedNews.contains(story) ? Icons.bookmark : Icons.bookmark_border, color: savedNews.contains(story) ? cyan : null),
+            ),
+          )],
         ),
         body: LayoutBuilder(builder: (context, c) => Center(
               child: ConstrainedBox(
@@ -555,26 +735,18 @@ class NewsDetailScreen extends StatelessWidget {
                         Icon(Icons.verified, color: Color(0xFF51E5A8)),
                         SizedBox(width: 10),
                         Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                          Text('Verified source', style: TextStyle(fontWeight: FontWeight.bold)),
-                          Text('Source and location checked by GEOTIX', style: TextStyle(color: muted, fontSize: 11)),
+                          Text('Publisher source', style: TextStyle(fontWeight: FontWeight.bold)),
+                          Text('Open the original report to verify full details', style: TextStyle(color: muted, fontSize: 11)),
                         ])),
                       ]),
                     ),
                     const SizedBox(height: 22),
-                    const Text(
-                      'This is the first GEOTIX news-detail prototype. The story is connected to its real-world location so users can understand where an event is happening and which communities it affects.',
-                      style: TextStyle(fontSize: 16, height: 1.65, color: Color(0xFFD4E0E7)),
-                    ),
-                    const SizedBox(height: 16),
-                    const Text(
-                      'The production version will load verified reporting from the news service, show the original publisher, preserve publication time, and display related updates from nearby districts and states.',
-                      style: TextStyle(fontSize: 16, height: 1.65, color: Color(0xFFD4E0E7)),
-                    ),
+                    Text('Reported by ${story.source}. GEOTIX displays the headline and location context from the live feed. Open the original source for the complete report.', style: const TextStyle(fontSize: 16, height: 1.65, color: Color(0xFFD4E0E7))),
                     const SizedBox(height: 24),
                     SizedBox(
                       height: 54,
                       child: FilledButton.icon(
-                        onPressed: () {},
+                        onPressed: story.url.isEmpty ? null : () => Navigator.push(context, MaterialPageRoute(builder: (_) => ArticleWebScreen(title: story.source, url: story.url))),
                         icon: const Icon(Icons.open_in_new),
                         label: const Text('VIEW ORIGINAL SOURCE'),
                       ),
@@ -587,9 +759,178 @@ class NewsDetailScreen extends StatelessWidget {
 }
 
 class Story {
-  const Story(this.category, this.place, this.title, this.time, this.color);
-  final String category, place, title, time;
+  const Story(this.category, this.place, this.title, this.time, this.color, {this.url = '', this.source = 'News source'});
+  final String category, place, title, time, url, source;
   final Color color;
+
+  Map<String, dynamic> toJson() => {
+        'category': category,
+        'place': place,
+        'title': title,
+        'time': time,
+        'color': color.toARGB32(),
+        'url': url,
+        'source': source,
+      };
+
+  factory Story.fromJson(Map<String, dynamic> json) => Story(
+        json['category'] as String? ?? 'LATEST',
+        json['place'] as String? ?? 'Unknown location',
+        json['title'] as String? ?? 'Untitled story',
+        json['time'] as String? ?? 'Recently',
+        Color(json['color'] as int? ?? 0xFF19BDEB),
+        url: json['url'] as String? ?? '',
+        source: json['source'] as String? ?? 'News source',
+      );
+}
+
+class SavedNewsStore extends ChangeNotifier {
+  static const String _storageKey = 'geotix_saved_stories_v1';
+  final SharedPreferencesAsync _preferences = SharedPreferencesAsync();
+  final List<Story> _items = [];
+  List<Story> get items => List.unmodifiable(_items);
+
+  Future<void> load() async {
+    try {
+      final saved = await _preferences.getString(_storageKey);
+      if (saved == null || saved.isEmpty) return;
+      final decoded = jsonDecode(saved) as List<dynamic>;
+      _items
+        ..clear()
+        ..addAll(decoded.whereType<Map<String, dynamic>>().map(Story.fromJson));
+    } catch (_) {
+      _items.clear();
+    }
+  }
+
+  Future<void> _persist() async {
+    final encoded = jsonEncode(_items.map((story) => story.toJson()).toList());
+    await _preferences.setString(_storageKey, encoded);
+  }
+
+  String _key(Story story) => story.url.isNotEmpty ? story.url : '${story.title}|${story.place}';
+  bool contains(Story story) => _items.any((item) => _key(item) == _key(story));
+
+  void toggle(Story story) {
+    final index = _items.indexWhere((item) => _key(item) == _key(story));
+    if (index >= 0) {
+      _items.removeAt(index);
+    } else {
+      _items.insert(0, story);
+    }
+    notifyListeners();
+    unawaited(_persist());
+  }
+}
+
+class LiveNewsService {
+  static Future<List<Story>> fetch(String place, String region) async {
+    final query = Uri.encodeQueryComponent('"$place" news');
+    final uri = Uri.parse('https://news.google.com/rss/search?q=$query&hl=en-IN&gl=IN&ceid=IN:en');
+    final client = HttpClient()..connectionTimeout = const Duration(seconds: 12);
+    try {
+      final request = await client.getUrl(uri);
+      request.headers.set(HttpHeaders.userAgentHeader, 'GEOTIX/1.0');
+      final response = await request.close().timeout(const Duration(seconds: 15));
+      if (response.statusCode != HttpStatus.ok) throw HttpException('News request failed');
+      final xml = await utf8.decoder.bind(response).join();
+      final items = RegExp(r'<item>([\s\S]*?)</item>', caseSensitive: false).allMatches(xml).take(15);
+      return items.map((match) {
+        final item = match.group(1)!;
+        final rawTitle = _tag(item, 'title');
+        final title = _decode(rawTitle);
+        final source = _decode(_tag(item, 'source')).trim().isEmpty ? _publisherFromTitle(title) : _decode(_tag(item, 'source'));
+        final category = _category(title);
+        return Story(
+          category,
+          '$place, $region',
+          title,
+          _timeAgo(_tag(item, 'pubDate')),
+          _categoryColor(category),
+          url: _decode(_tag(item, 'link')),
+          source: source,
+        );
+      }).where((story) => story.title.isNotEmpty).toList();
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  static String _tag(String item, String name) {
+    final match = RegExp('<$name(?:\\s[^>]*)?>([\\s\\S]*?)</$name>', caseSensitive: false).firstMatch(item);
+    return match?.group(1)?.replaceAll('<![CDATA[', '').replaceAll(']]>', '').trim() ?? '';
+  }
+
+  static String _decode(String value) => value
+      .replaceAll('&amp;', '&')
+      .replaceAll('&quot;', '"')
+      .replaceAll('&#39;', "'")
+      .replaceAll('&apos;', "'")
+      .replaceAll('&lt;', '<')
+      .replaceAll('&gt;', '>');
+
+  static String _publisherFromTitle(String title) {
+    final index = title.lastIndexOf(' - ');
+    return index < 0 ? 'News source' : title.substring(index + 3);
+  }
+
+  static String _category(String title) {
+    final value = title.toLowerCase();
+    if (RegExp(r'weather|rain|storm|cyclone|flood|heatwave|forecast').hasMatch(value)) return 'WEATHER';
+    if (RegExp(r'technology|tech|artificial intelligence|\bai\b|robot|software|startup').hasMatch(value)) return 'TECHNOLOGY';
+    if (RegExp(r'travel|tourism|tourist|airport|flight|railway|train|hotel').hasMatch(value)) return 'TRAVEL';
+    if (RegExp(r'breaking|accident|fire|earthquake|explosion|emergency|killed').hasMatch(value)) return 'BREAKING';
+    return 'LOCAL';
+  }
+
+  static Color _categoryColor(String category) {
+    switch (category) {
+      case 'BREAKING': return const Color(0xFFFF4C61);
+      case 'WEATHER': return const Color(0xFF8B7CFF);
+      case 'TRAVEL': return const Color(0xFFFFB84D);
+      case 'TECHNOLOGY': return const Color(0xFF19BDEB);
+      default: return const Color(0xFF51E5A8);
+    }
+  }
+
+  static String _timeAgo(String raw) {
+    final date = DateTime.tryParse(raw)?.toLocal();
+    if (date == null) return 'Recently';
+    final difference = DateTime.now().difference(date);
+    if (difference.inMinutes < 60) return '${difference.inMinutes.clamp(1, 59)} min ago';
+    if (difference.inHours < 24) return '${difference.inHours} hr ago';
+    return '${difference.inDays} day${difference.inDays == 1 ? '' : 's'} ago';
+  }
+}
+
+class ArticleWebScreen extends StatefulWidget {
+  const ArticleWebScreen({super.key, required this.title, required this.url});
+  final String title, url;
+  @override
+  State<ArticleWebScreen> createState() => _ArticleWebScreenState();
+}
+
+class _ArticleWebScreenState extends State<ArticleWebScreen> {
+  late final WebViewController webController;
+  int progress = 0;
+  @override
+  void initState() {
+    super.initState();
+    webController = WebViewController()
+      ..setJavaScriptMode(JavaScriptMode.unrestricted)
+      ..setNavigationDelegate(NavigationDelegate(onProgress: (value) {
+        if (mounted) setState(() => progress = value);
+      }))
+      ..loadRequest(Uri.parse(widget.url));
+  }
+  @override
+  Widget build(BuildContext context) => Scaffold(
+    appBar: AppBar(title: Text(widget.title, maxLines: 1, overflow: TextOverflow.ellipsis)),
+    body: Column(children: [
+      if (progress < 100) LinearProgressIndicator(value: progress / 100, color: cyan, backgroundColor: panel),
+      Expanded(child: WebViewWidget(controller: webController)),
+    ]),
+  );
 }
 
 class StoryCard extends StatelessWidget {
@@ -612,17 +953,36 @@ class StoryCard extends StatelessWidget {
             Text(story.place, style: const TextStyle(color: muted, fontSize: 12), overflow: TextOverflow.ellipsis),
             const Text('✓ Verified source', style: TextStyle(color: Color(0xFF51E5A8), fontSize: 11)),
           ])),
-          IconButton(onPressed: () {}, icon: const Icon(Icons.bookmark_border)),
+          AnimatedBuilder(
+            animation: savedNews,
+            builder: (context, _) => IconButton(
+              tooltip: savedNews.contains(story) ? 'Remove from saved' : 'Save story',
+              onPressed: () {
+                final wasSaved = savedNews.contains(story);
+                savedNews.toggle(story);
+                ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                  content: Text(wasSaved ? 'Removed from Saved' : 'Story saved'),
+                  duration: const Duration(seconds: 1),
+                ));
+              },
+              icon: Icon(savedNews.contains(story) ? Icons.bookmark : Icons.bookmark_border, color: savedNews.contains(story) ? cyan : null),
+            ),
+          ),
           ])),
         ),
       );
 }
 
 class SearchBox extends StatelessWidget {
-  const SearchBox({super.key, required this.hint});
+  const SearchBox({super.key, required this.hint, this.controller, this.onSubmitted});
   final String hint;
+  final TextEditingController? controller;
+  final ValueChanged<String>? onSubmitted;
   @override
   Widget build(BuildContext context) => TextField(
+        controller: controller,
+        textInputAction: TextInputAction.search,
+        onSubmitted: onSubmitted,
         decoration: InputDecoration(hintText: hint, hintStyle: const TextStyle(color: Color(0xFF718795)), prefixIcon: const Icon(Icons.search), filled: true, fillColor: panel, border: OutlineInputBorder(borderRadius: BorderRadius.circular(18), borderSide: BorderSide.none)),
       );
 }
